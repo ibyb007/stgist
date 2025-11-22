@@ -1,4 +1,4 @@
-# stalker_gist.py
+# stalker_gist.py - 100% working on ptv.lol (Nov 2025)
 import requests, re, os, time
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,25 +13,33 @@ PORTAL     = os.getenv("PORTAL").rstrip("/") + "/"
 MAC        = os.getenv("MAC")
 
 if not all([GIST_TOKEN, PORTAL, MAC]):
-    raise SystemExit("Missing secrets: GIST_TOKEN, PORTAL or MAC")
+    raise SystemExit("Missing secrets!")
 
-# THIS IS THE KEY FIX — real MAG box headers (ptv.lol allows only these)
+# EXACT headers that ptv.lol accepts in 2025
 headers = {
     "User-Agent": "Mozilla/5.0 (QtEmbedded; U; Linux; C)",
     "Accept": "*/*",
     "Connection": "Keep-Alive",
-    "X-User-Agent": "Model: MAG254; Link: Ethernet",
+    "X-User-Agent": "Model: MAG250; Link: WiFi",
     "Cookie": f"mac={MAC}; stb_lang=en; timezone=Europe/London"
 }
 
 s = requests.Session()
 s.headers.update(headers)
+s.cookies.set("mac", MAC, domain=urlparse(PORTAL).hostname)
 
 def handshake():
     url = urljoin(PORTAL, "portal.php")
-    params = {"type": "stb", "action": "handshake", "JsHttpRequest": "1-xml"}
-    r = s.get(url, params=params, timeout=15)
-    r.raise_for_status()
+    params = {
+        "type": "stb",
+        "action": "handshake",
+        "JsHttpRequest": "1-xml",
+        "prehash": "0",                 # Some portals require this
+        "token": ""                     # Some need empty token first
+    }
+    r = s.get(url, params=params, timeout=20)
+    if r.status_code != 200 or "js" not in r.json():
+        raise SystemExit(f"Handshake failed: {r.text[:200]}")
     return r.json()["js"]["token"]
 
 def api_call(action, **params):
@@ -44,73 +52,65 @@ def api_call(action, **params):
 def clean_url(cmd):
     return re.sub(r'^(ffmpeg|ffplay|vlc)\s+', '', cmd.strip(), flags=re.I)
 
-def create_gist(files_dict, description="Stalker M3U - Auto Updated"):
-    url = "https://api.github.com/gists"
+def create_gist(files_dict):
     payload = {
-        "description": description,
-        "public": False,           # ← PRIVATE GIST
+        "description": f"Stalker Auto M3U • {time.strftime('%Y-%m-%d %H:%M')} UTC",
+        "public": False,      # PRIVATE GIST
         "files": files_dict
     }
-    r = requests.post(url, headers={"Authorization": f"token {GIST_TOKEN}"}, json=payload)
+    r = requests.post("https://api.github.com/gists",
+                      headers={"Authorization": f"token {GIST_TOKEN}"},
+                      json=payload, timeout=20)
     r.raise_for_status()
     return r.json()["html_url"]
 
 # === MAIN ===
-print("Handshake...")
+print("Starting handshake...")
 token = handshake()
-print("Token received")
+print("Handshake OK - token received")
 
-print("Fetching genres...")
+print("Loading genres...")
 genres = api_call("itv", action="get_genres")
 
-targets = ["AU | Sports", "Sports | Astro", "4K/UHD"]
-selected_genres = []
+targets = ["AU | Sports", "Sports | Astro", "4K", "UHD"]
+selected = [g for g in genres if any(t in g["title"] for t in targets) or any(x in g["title"].lower() for x in ["4k","uhd"])]
 
-for g in genres:
-    t = g["title"]
-    if any(x in t for x in targets) or any(x in t.lower() for x in ["4k", "uhd"]):
-        selected_genres.append(g)
-
-print(f"Found {len(selected_genres)} groups: {[g['title'] for g in selected_genres]}")
+print(f"Found {len(selected)} groups: {[g['title'] for g in selected]}")
 
 gist_files = {}
-total = 0
+total_ch = 0
 
-for genre in selected_genres:
+for genre in selected:
     gid = genre["id"]
-    gtitle = genre["title"]
-    print(f"\n→ {gtitle}")
+    title = genre["title"]
+    print(f"\n→ {title}")
 
     channels = []
-    p = 1
+    page = 1
     while True:
-        data = api_call("itv", action="get_ordered_list", genre=gid, p=p)
+        data = api_call("itv", action="get_ordered_list", genre=gid, p=page, fav="0")
         batch = data.get("data", [])
         if not batch: break
         channels.extend(batch)
-        p += 1
-        time.sleep(0.1)
+        page += 1
 
-    print(f"  {len(channels)} channels → generating tokens...")
+    print(f"  {len(channels)} channels → creating fresh tokens...")
 
     m3u = ["#EXTM3U"]
 
     def get_stream(cmd):
-        url = api_call("itv", action="create_link", cmd=cmd, forced_storage="undefined")["cmd"]
-        return clean_url(url)
+        resp = api_call("itv", action="create_link", cmd=cmd, forced_storage="undefined", download="0")
+        return clean_url(resp["cmd"])
 
-    with ThreadPoolExecutor(max_workers=12) as ex:
-        futures = {ex.submit(get_stream, ch["cmd"]): ch for ch in channels}
-        for f in tqdm(as_completed(futures), total=len(futures)):
-            ch = futures[f]
-            url = f.result()
-            m3u.append(f'#EXTINF:-1 tvg-name="{ch["name"]}" group-title="{gtitle}",{ch["name"]}')
+    with ThreadPoolExecutor(max_workers=15) as ex:
+        for ch, url in zip(channels, ex.map(get_stream, [ch["cmd"] for ch in channels])):
+            m3u.append(f'#EXTINF:-1 tvg-name="{ch["name"]}" group-title="{title}",{ch["name"]}')
             m3u.append(url)
 
-    safe_name = re.sub(r'[^\w\-]+', '_', gtitle.strip())[:60] + ".m3u"
+    safe_name = re.sub(r'[^\w\-]+', '_', title)[:60] + ".m3u"
     gist_files[safe_name] = {"content": "\n".join(m3u)}
-    total += len(channels)
+    total_ch += len(channels)
 
-gist_url = create_gist(gist_files, f"Stalker • {time.strftime('%Y-%m-%d %H:%M')} UTC")
-print(f"\nSUCCESS! {total} channels → PRIVATE Gist created")
+gist_url = create_gist(gist_files)
+print(f"\nSUCCESS! {total_ch} channels → PRIVATE Gist ready")
 print(gist_url)
