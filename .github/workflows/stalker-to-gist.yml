@@ -1,0 +1,35 @@
+name: Stalker → Gist Auto Update
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'     # Runs every 2 hours (adjust as needed)
+  workflow_dispatch:          # Allows manual run
+
+jobs:
+  export-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests tqdm
+
+      - name: Run Stalker extractor & upload to Gist
+        env:
+          PORTAL: ${{ secrets.STALKER_PORTAL }}
+          MAC: ${{ secrets.STALKER_MAC }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}   # Create a Personal Access Token with "gist" scope
+        run: |
+          python stalker_gist.py
+
+      - name: Commit empty change (to show last run time)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git commit --allow-empty -m "Trigger: Updated Stalker M3U Gists $(date)"
+          git push
